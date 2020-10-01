@@ -11,6 +11,7 @@ import ie.gov.tracing.Tracing
 import ie.gov.tracing.storage.SharedPrefs
 import java.io.PrintWriter
 import java.io.StringWriter
+import ie.gov.tracing.network.Fetcher
 
 // central logging and events
 class Events {
@@ -21,7 +22,7 @@ class Events {
         const val ON_STATUS_CHANGED = "onStatusChanged" // tracing api status
         const val ON_EXPOSURE = "exposure"
 
-        private const val TAG = "RNExposureNotification"
+        private const val TAG = "RNExposureNotificationService"
 
         private fun raiseEvent(map: ReadableMap) {
             Tracing.reactContext.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)?.emit("exposureEvent", map)
@@ -33,14 +34,15 @@ class Events {
                 isDebuggable = 0 != Tracing.currentContext.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE
             } catch (ex: Exception) {}
 
-            if (isDebuggable || Config.debug) return true // allow all events in debug
-            if(eventName == ON_STATUS_CHANGED || eventName == ON_EXPOSURE) return true // allow these debug or release
-
-            return false
+            if (eventName == "ERROR" && !isDebuggable) return false // allow all events in debug
+            // if(eventName == ON_STATUS_CHANGED || eventName == ON_EXPOSURE) return true // allow these debug or release
+            
+            return true
         }
 
         @JvmStatic
         fun raiseEvent(eventName: String, eventValue: String?): Boolean {
+            Log.d(TAG, "$eventName: $eventValue")
             if(!allowed(eventName)) return false
             val map = Arguments.createMap()
             try {
@@ -55,8 +57,10 @@ class Events {
 
         @JvmStatic
         fun raiseEvent(eventName: String, eventValue: ReadableMap?): Boolean {
+            Log.d(TAG, eventName)
             if(!allowed(eventName)) return false
             val map = Arguments.createMap()
+            
             try {
                 map.putMap(eventName, eventValue)
                 raiseEvent(map)
@@ -69,6 +73,7 @@ class Events {
 
         @JvmStatic
         fun raiseError(message: String, ex: Exception) {
+            Log.e(TAG, "Error: $message: $ex")
             try {
                 if(allowed(ERROR)) { // if debugging allow stacktrace
                     var sw = StringWriter()
@@ -82,7 +87,7 @@ class Events {
                     SharedPrefs.setString("lastError", "$ex - $sw", Tracing.currentContext)
                     raiseEvent(ERROR, "$message: $ex - $sw")
                 } else { // otherwise just log generic message
-                    Log.e(TAG, "error: $ex")
+                    raiseEvent(ERROR, "$message: $ex")
                 }
             } catch (ex: Exception) {
                 Log.e(TAG, ex.toString())

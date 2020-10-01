@@ -48,13 +48,19 @@ class Fetcher {
 
         fun downloadFile(filename: String, context: Context): File? {
             try {
-                val serverUrl = SharedPrefs.getString("serverUrl", context)
+                val keyServerUrl = SharedPrefs.getString("keyServerUrl", context)
+                val keyServerType = SharedPrefs.getString("keyServerType", context)
                 val authToken = SharedPrefs.getString("authToken", context)
-                val fileUrl = "${serverUrl}/data/$filename"
+                var fileUrl = "${keyServerUrl}/data/$filename"
+                if (keyServerType == "google") {
+                    fileUrl = "${keyServerUrl}/$filename"
+                } 
                 Events.raiseEvent(Events.INFO, "downloadFile - $fileUrl")
                 val url = URL(fileUrl)
                 val urlConnection = url.openConnection() as HttpURLConnection
-                urlConnection.setRequestProperty("Authorization", "Bearer $authToken")
+                if (keyServerType == "nearform") {
+                    urlConnection.setRequestProperty("Authorization", "Bearer $authToken")
+                }
                 urlConnection.setRequestProperty("Accept", "application/zip")
 
                 val keyFile = File(context.filesDir, String.format(FILE_PATTERN, uniq()))
@@ -137,16 +143,21 @@ class Fetcher {
         }
 
         @JvmStatic
-        fun fetch(endpoint: String, retry: Boolean = false, context: Context): String? {
+        fun fetch(endpoint: String, retry: Boolean = false, keyFile: Boolean = false, context: Context): String? {
             try {
-                val serverUrl = SharedPrefs.getString("serverUrl", context)
+                var serverUrl = SharedPrefs.getString("serverUrl", context)
+                if (keyFile) {
+                    serverUrl = SharedPrefs.getString("keyServerUrl", context)
+                }
+                val keyServerType = SharedPrefs.getString("keyServerType", context)
                 val authToken = SharedPrefs.getString("authToken", context)
 
                 Events.raiseEvent(Events.INFO, "fetch - fetching from: ${serverUrl}$endpoint")
                 val url = URL("${serverUrl}$endpoint")
                 val urlConnection = url.openConnection() as HttpURLConnection
-                urlConnection.setRequestProperty("Authorization", "Bearer $authToken")
-
+                if ((keyServerType == "nearform" && keyFile) || !keyFile) {
+                    urlConnection.setRequestProperty("Authorization", "Bearer $authToken")
+                }                
                 Events.raiseEvent(Events.INFO, "fetch - response: ${urlConnection.responseCode}")
 
                 if (urlConnection.responseCode == HttpURLConnection.HTTP_UNAUTHORIZED) {
@@ -165,7 +176,7 @@ class Fetcher {
                     return if (newAuthToken != null) {
                         SharedPrefs.setString("authToken", newAuthToken, context)
                         // recursively call again with retry set
-                        fetch(endpoint, true, context)
+                        fetch(endpoint, true, keyFile, context)
                     } else {
                         Events.raiseEvent(Events.ERROR, "fetch - Unauthorized")
                         null
@@ -194,7 +205,6 @@ class Fetcher {
                 val notificationSent = SharedPrefs.getLong("notificationSent", context)
                 var callbackNum = SharedPrefs.getString("callbackNumber", context)
 
-
                 if (notificationSent > 0) {
                     Events.raiseEvent(Events.INFO, "triggerCallback - notification " +
                             "already sent: " + notificationSent)
@@ -206,6 +216,10 @@ class Fetcher {
                     try {
                         val store = ExpoSecureStoreInterop(context)
                         val jsonStr = store.getItemImpl("cti.callBack")
+                        if (jsonStr.isEmpty()) {
+                            Events.raiseEvent(Events.INFO, "triggerCallback - no callback recovery")
+                            return;
+                        }
                         val callBackData = Gson().fromJson(jsonStr, CallbackRecovery::class.java)
 
                         if(callBackData.code == null || callBackData.number == null){
@@ -213,8 +227,6 @@ class Fetcher {
                             return;
                         }
                         callbackNum = callBackData.code +  callBackData.number
-
-
                     } catch (exExpo: Exception) {
                         Events.raiseError("ExpoSecureStoreInterop", exExpo)
                     }
@@ -227,11 +239,15 @@ class Fetcher {
                     }
                 }
 
-                val dayInMs = 1000 * 60 * 60 * 24
-                val notificationDate = exposureEntity.createdTimestampMs
-                val daysSinceExposure = notificationDate - (exposureEntity.daysSinceLastExposure() * dayInMs)
+                val calendar = Calendar.getInstance()
+                calendar.add(Calendar.DAY_OF_YEAR, 0 - exposureEntity.daysSinceLastExposure())
+                calendar.set(Calendar.HOUR_OF_DAY, 0)
+                calendar.set(Calendar.MINUTE, 0)
+                calendar.set(Calendar.SECOND, 0)
+                calendar.set(Calendar.MILLISECOND, 0)
+                val daysSinceExposure = calendar.time.time
 
-                Events.raiseEvent(Events.INFO, "triggerCallback - sending: ${Date(daysSinceExposure)}")
+                Events.raiseEvent(Events.INFO, "triggerCallback - sending: ${daysSinceExposure} ${Date(daysSinceExposure)}")
                 val callbackParams = Callback(callbackNum, daysSinceExposure, payload)
                 val success = post("/callback", Gson().toJson(callbackParams), context)
 
@@ -243,7 +259,6 @@ class Fetcher {
                 Events.raiseEvent(Events.INFO, "triggerCallback - success")
                 SharedPrefs.setLong("notificationSent", System.currentTimeMillis(), context)
 
-                saveMetric("CALLBACK_REQUEST", context)
             } catch(ex: Exception) {
                 Events.raiseError("triggerCallback - error", ex)
             }
@@ -253,7 +268,7 @@ class Fetcher {
         fun saveMetric(event: String, context: Context, payload: Map<String, Any>? = null) {
             try {
                 val analytics = SharedPrefs.getBoolean("analyticsOptin", context)
-                val version = SharedPrefs.getString("version", context)
+                val version = Tracing.version().getString("display").toString()
 
                 if(!analytics) {
                     Events.raiseEvent(Events.INFO, "saveMetric - not saving, no opt in")
@@ -265,11 +280,11 @@ class Fetcher {
                 val success = post("/metrics", Gson().toJson(metric), context)
 
                 if (!success) {
-                    Events.raiseEvent(Events.ERROR, "saveMetric - failed")
+                    Events.raiseEvent(Events.ERROR, "saveMetric - failed: $event")
                     return
                 }
 
-                Events.raiseEvent(Events.INFO, "saveMetric - success")
+                Events.raiseEvent(Events.INFO, "saveMetric - success, $event, $version")
             } catch(ex: Exception) {
                 Events.raiseError("triggerCallback - error", ex)
             }

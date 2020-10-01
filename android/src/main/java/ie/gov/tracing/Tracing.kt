@@ -3,6 +3,7 @@ package ie.gov.tracing
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
+import android.content.BroadcastReceiver
 import android.content.IntentSender.SendIntentException
 import androidx.work.await
 import com.facebook.react.bridge.*
@@ -23,6 +24,14 @@ import ie.gov.tracing.storage.SharedPrefs
 import ie.gov.tracing.storage.SharedPrefs.Companion.getLong
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import ie.gov.tracing.nearby.StateUpdatedWorker
+import android.content.IntentFilter
+import android.bluetooth.BluetoothAdapter;
+import android.content.pm.PackageInfo
+import android.location.LocationManager
+import android.os.Build
+import androidx.core.content.pm.PackageInfoCompat
+import androidx.core.location.LocationManagerCompat
 
 class Listener: ActivityEventListener {
     override fun onNewIntent(intent: Intent?) {}
@@ -93,6 +102,18 @@ class Listener: ActivityEventListener {
     }
 }
 
+class BleStatusReceiver : BroadcastReceiver() {
+
+    override fun onReceive(context: Context, intent: Intent) {
+
+        if (BluetoothAdapter.ACTION_STATE_CHANGED == intent.action) {
+            Tracing.getExposureStatus(null)
+        }
+        Events.raiseEvent(Events.INFO,"bleStatusUpdate - $intent.action")
+        Tracing.setExposureStatus(Tracing.exposureStatus, Tracing.exposureDisabledReason)
+    }
+}
+
 class Tracing {
     companion object {
         const val MIN_PLAY_SERVICES_VERSION = 201817017
@@ -105,6 +126,7 @@ class Tracing {
         const val STATUS_STARTED = "STARTED"
         const val STATUS_STARTING = "STARTING"
         const val STATUS_STOPPED = "STOPPED"
+        const val STATUS_PAUSED = "PAUSED"
 
         private const val EXPOSURE_STATUS_UNKNOWN = "unknown"
         private const val EXPOSURE_STATUS_ACTIVE = "active"
@@ -115,8 +137,8 @@ class Tracing {
         private const val STATUS_STOPPING = "STOPPING"
 
         var status = STATUS_STOPPED
-        private var exposureStatus = EXPOSURE_STATUS_UNKNOWN
-        private var exposureDisabledReason = ""
+        var exposureStatus = EXPOSURE_STATUS_UNAVAILABLE
+        var exposureDisabledReason = "starting"
 
         private lateinit var exposureWrapper: ExposureNotificationClientWrapper
 
@@ -203,10 +225,7 @@ class Tracing {
             override fun onSuccess(message: String) {
                 try {
                     Events.raiseEvent(Events.INFO, "authorisationCallback - success")
-                    // only start scheduler if starting, this path occurs during authorisation too
-                    // so we dont start sceduler when just authorising
                     if (status == STATUS_STARTING) {
-                        ProvideDiagnosisKeysWorker.startScheduler()
                         setNewStatus(STATUS_STARTED)
                         startPromise?.resolve(true)
                     } else {
@@ -234,6 +253,14 @@ class Tracing {
                 exposureWrapper = ExposureNotificationClientWrapper.get(context)
                 reactContext.addActivityEventListener(Listener())
                 currentContext = context // this is overridden depending on path into codebase
+
+                scheduleCheckExposure()
+
+                val br: BroadcastReceiver = BleStatusReceiver()
+                val filter = IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED).apply {
+                    addAction(Intent.EXTRA_INTENT)
+                }
+                context.registerReceiver(br, filter)                
             } catch (ex: Exception) {
                 Events.raiseError("init", ex)
             }
@@ -253,6 +280,7 @@ class Tracing {
         fun start(promise: Promise?) {
             try {
                 setNewStatus(STATUS_STARTING)
+                SharedPrefs.setBoolean("servicePaused", false, context)
                 if (promise != null) {
                     resolutionPromise = null
                     startPromise = promise
@@ -265,10 +293,36 @@ class Tracing {
         }
 
         @JvmStatic
+        fun pause(promise: Promise?) {
+            try {
+                setNewStatus(STATUS_STOPPING)
+                SharedPrefs.setBoolean("servicePaused", true, context)
+                val permissionHelperCallback: Callback = object : Callback {
+                    override fun onFailure(t: Throwable) {
+                        Events.raiseError("paused", Exception(t))
+                        setNewStatus(STATUS_PAUSED)
+                        promise?.resolve(true)
+                    }
+
+                    override fun onSuccess(status: String) {
+                        Events.raiseEvent(Events.INFO, "exposure tracing $status")
+                        ProvideDiagnosisKeysWorker.stopScheduler()
+                        setNewStatus(STATUS_PAUSED)
+                        promise?.resolve(true)
+                    }
+                }
+                ExposureNotificationHelper(permissionHelperCallback).stopExposure()
+            } catch (ex: Exception) {
+                Events.raiseError("paused", ex)
+                promise?.resolve(false)
+            }
+        }
+
+        @JvmStatic
         fun stop() {
             try {
                 setNewStatus(STATUS_STOPPING)
-
+                SharedPrefs.setBoolean("servicePaused", false, context)
                 val permissionHelperCallback: Callback = object : Callback {
                     override fun onFailure(t: Throwable) {
                         Events.raiseError("stop", Exception(t))
@@ -316,8 +370,8 @@ class Tracing {
                 val oldCheckFrequency = getLong("exposureCheckFrequency", context)
                 Config.configure(params)
                 val newCheckFrequency = getLong("exposureCheckFrequency", context)
-
-                if(newCheckFrequency != oldCheckFrequency && status == STATUS_STARTED) {
+                Events.raiseEvent(Events.INFO, "old: $oldCheckFrequency, new: $newCheckFrequency")
+                if(newCheckFrequency != oldCheckFrequency) {
                     scheduleCheckExposure()
                 }
             } catch (ex: Exception) {
@@ -329,6 +383,33 @@ class Tracing {
         fun checkExposure(readExposureDetails: Boolean = false) {
             extraDetails = readExposureDetails
             ProvideDiagnosisKeysWorker.startOneTimeWorkRequest()
+        }
+
+        @JvmStatic
+        fun simulateExposure(timeDelay: Long = 0) {
+            extraDetails = false
+            StateUpdatedWorker.simulateExposure(timeDelay)
+
+        }
+
+        @JvmStatic
+        fun version(): WritableMap {
+            var versionName: String
+            var versionCode: String
+            try {
+                val pinfo: PackageInfo = context.getPackageManager().getPackageInfo(context.getPackageName(), 0)
+                versionName = pinfo.versionName
+                versionCode = PackageInfoCompat.getLongVersionCode(pinfo).toString()           
+            } catch(e: Exception) {
+                versionName = "unknown"
+                versionCode = "unknown"
+            }
+            val data = Arguments.createMap()
+            data.putString("version", versionName)
+            data.putString("build", versionCode)
+            data.putString("display", "$versionName.$versionCode")
+            
+            return data
         }
 
         private fun getExposureKeyAsMap(tek: TemporaryExposureKey): WritableMap {
@@ -406,17 +487,17 @@ class Tracing {
                                 promise.resolve("granted")
                             } else {
                                 Events.raiseEvent(Events.INFO,"isAuthorised: denied")
-                                promise.resolve("denied")
+                                promise.resolve("blocked")
                             }
                         }
                         .addOnFailureListener { ex ->
                             Events.raiseError("isAuthorised - onFailure", ex)
                             handleApiException(ex)
-                            promise.resolve("denied")
+                            promise.resolve("blocked")
                         }
             } catch (ex: Exception) {
                 Events.raiseError("isAuthorised - exception", ex)
-                promise.resolve("denied")
+                promise.resolve("blocked")
             }
         }
 
@@ -572,17 +653,49 @@ class Tracing {
             }
         }
 
+       /**
+         * When it comes to Location and BLE, there are the following conditions:
+         * - Location on is only necessary to use bluetooth for Android M+.
+         * - Starting with Android S, there may be support for locationless BLE scanning
+         * => We only go into an error state if these conditions require us to have location on, but
+         * it is not activated on device.
+         */
+        private fun isLocationEnableRequired(): Boolean {
+            val locationManager: LocationManager = Tracing.context.getSystemService(Context.LOCATION_SERVICE) as LocationManager
+            return (!exposureWrapper.deviceSupportsLocationlessScanning()
+                    && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && locationManager != null && !LocationManagerCompat.isLocationEnabled(locationManager))
+        }
+
         @JvmStatic
         fun getExposureStatus(promise: Promise? = null): ReadableMap {
             val result: WritableMap = Arguments.createMap()
+            val typeData: WritableArray = Arguments.createArray()
+            val isPaused = SharedPrefs.getBoolean("servicePaused", context)
+            if (isPaused) {
+                exposureDisabledReason = "paused"
+            }
             try {
+                // check bluetooth
+                val bluetoothAdapter: BluetoothAdapter = BluetoothAdapter.getDefaultAdapter();
+                if (bluetoothAdapter != null && !bluetoothAdapter.isEnabled) {
+                    exposureStatus = EXPOSURE_STATUS_DISABLED
+                    exposureDisabledReason = "bluetooth";
+                }
+
+                if (isLocationEnableRequired()) {
+                    exposureStatus = EXPOSURE_STATUS_DISABLED
+                    exposureDisabledReason = "bluetooth";
+                }                
+
                 result.putString("state", exposureStatus)
-                result.putString("type", exposureDisabledReason)
+                typeData.pushString(exposureDisabledReason)
+                result.putArray("type", typeData)                
                 promise?.resolve(result)
             } catch (ex: Exception) {
                 Events.raiseError("getExposureStatus", ex)
                 result.putString("state", EXPOSURE_STATUS_UNKNOWN)
-                result.putString("type", "error")
+                typeData.pushString("error")
+                result.putArray("type", typeData)                
                 promise?.resolve(result)
             }
             return result

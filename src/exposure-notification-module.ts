@@ -1,4 +1,5 @@
 import {NativeModules, EventSubscriptionVendor} from 'react-native';
+import {Version} from './types';
 
 export enum AuthorisedStatus {
   granted = 'granted',
@@ -8,14 +9,20 @@ export enum AuthorisedStatus {
   unknown = 'unknown'
 }
 
+export enum KeyServerType {
+  nearform = 'nearform',
+  google = 'google'
+}
+
 export interface ConfigurationOptions {
   exposureCheckFrequency: number;
   serverURL: string;
+  keyServerUrl: string;
+  keyServerType: KeyServerType;
   authToken: string;
   refreshToken: string;
   storeExposuresFor: number;
   fileLimit: number;
-  version: string;
   notificationTitle: string;
   notificationDesc: string;
   callbackNumber: string;
@@ -36,6 +43,7 @@ export interface CloseContact {
 }
 
 export enum StatusState {
+  unavailable = 'unavailable',
   unknown = 'unknown',
   restricted = 'restricted',
   disabled = 'disabled',
@@ -45,7 +53,9 @@ export enum StatusState {
 export enum StatusType {
   bluetooth = 'bluetooth',
   exposure = 'exposure',
-  resolution = 'resolution'
+  resolution = 'resolution',
+  paused = 'paused',
+  starting = 'starting'
 }
 
 export interface Status {
@@ -68,6 +78,8 @@ export interface ExposureNotificationModule extends EventSubscriptionVendor {
 
   start(): Promise<boolean>;
 
+  pause(): Promise<boolean>;
+
   stop(): Promise<boolean>;
 
   deleteAllData(): Promise<boolean>;
@@ -78,11 +90,17 @@ export interface ExposureNotificationModule extends EventSubscriptionVendor {
 
   checkExposure(readDetails?: boolean, skipTimeCheck?: boolean): void;
 
+  simulateExposure(timeDelay?: number): void;
+
   getCloseContacts(): Promise<CloseContact[]>;
 
   status(): Promise<Status>;
 
   getLogData(): Promise<any>;
+
+  version(): Promise<Version>;
+
+  bundleId(): Promise<string>;
 
   /**
    * @platform android

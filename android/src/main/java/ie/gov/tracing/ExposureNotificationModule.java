@@ -2,12 +2,14 @@ package ie.gov.tracing;
 
 import android.app.Activity;
 import android.os.Build;
+import android.content.pm.PackageInfo;
 import com.facebook.react.bridge.Arguments;
 import com.facebook.react.bridge.Promise;
 import com.facebook.react.bridge.ReactApplicationContext;
 import com.facebook.react.bridge.ReactContextBaseJavaModule;
 import com.facebook.react.bridge.ReactMethod;
 import com.facebook.react.bridge.ReadableMap;
+import com.facebook.react.bridge.WritableMap;
 import com.google.android.gms.common.GoogleApiAvailability;
 
 import org.jetbrains.annotations.NotNull;
@@ -83,6 +85,15 @@ public class ExposureNotificationModule extends ReactContextBaseJavaModule {
     }
 
     @ReactMethod
+    public void pause(Promise promise) {
+        if(nearbyNotSupported()){
+            promise.resolve(false);
+            return;
+        }
+        Tracing.pause(promise);
+    }
+
+    @ReactMethod
     public void stop() {
         if(nearbyNotSupported()) return;
         Tracing.stop();
@@ -111,6 +122,12 @@ public class ExposureNotificationModule extends ReactContextBaseJavaModule {
     public void checkExposure(Boolean readExposureDetails, Boolean skipTimeCheck) {
         if(nearbyNotSupported()) return;
         Tracing.checkExposure(readExposureDetails);
+    }
+
+    @ReactMethod
+    public void simulateExposure(Integer timeDelay) {
+        if(nearbyNotSupported()) return;
+        Tracing.simulateExposure(timeDelay.longValue());
     }
 
     @ReactMethod
@@ -193,5 +210,20 @@ public class ExposureNotificationModule extends ReactContextBaseJavaModule {
             return;
         }
         promise.resolve(true);
+    }
+
+    @ReactMethod
+    public void version(Promise promise) {
+        WritableMap version = Tracing.version();
+        promise.resolve(version);
+    }
+
+    @ReactMethod
+    public void bundleId(Promise promise) {
+            promise.resolve(Tracing.reactContext.getApplicationContext().getPackageName());
+    }
+
+    private PackageInfo getPackageInfo() throws Exception {
+        return Tracing.reactContext.getApplicationContext().getPackageManager().getPackageInfo(Tracing.reactContext.getApplicationContext().getPackageName(), 0);
     }
 }

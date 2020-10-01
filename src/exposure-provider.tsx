@@ -4,7 +4,6 @@ import React, {
   createContext,
   useCallback,
   useContext,
-  useRef,
   SetStateAction
 } from 'react';
 import {
@@ -19,7 +18,9 @@ import ExposureNotification, {
   AuthorisedStatus,
   StatusState,
   Status,
-  CloseContact
+  CloseContact,
+  StatusType,
+  KeyServerType
 } from './exposure-notification-module';
 
 import {getPermissions, requestPermissions} from './utils/permissions';
@@ -43,10 +44,12 @@ interface State {
 }
 
 export interface ExposureContextValue extends State {
-  start: () => void;
+  start: () => Promise<boolean>;
   stop: () => void;
+  pause: () => Promise<boolean>;
   configure: () => void;
   checkExposure: (readDetails: boolean, skipTimeCheck: boolean) => void;
+  simulateExposure: (timeDelay: number) => void;
   getDiagnosisKeys: () => Promise<any[]>;
   exposureEnabled: () => Promise<boolean>;
   authoriseExposure: () => Promise<boolean>;
@@ -63,7 +66,8 @@ export interface ExposureContextValue extends State {
 
 const initialState = {
   status: {
-    state: StatusState.unknown
+    state: StatusState.unavailable,
+    type: [StatusType.starting]
   },
   supported: false,
   canSupport: false,
@@ -79,10 +83,12 @@ const initialState = {
 
 export const ExposureContext = createContext<ExposureContextValue>({
   ...initialState,
-  start: () => {},
+  start: () => Promise.resolve(false),
   stop: () => {},
+  pause: () => Promise.resolve(false),
   configure: () => {},
   checkExposure: () => {},
+  simulateExposure: () => {},
   getDiagnosisKeys: () => Promise.resolve([]),
   exposureEnabled: () => Promise.resolve(false),
   authoriseExposure: () => Promise.resolve(false),
@@ -100,33 +106,50 @@ export const ExposureContext = createContext<ExposureContextValue>({
 export interface ExposureProviderProps {
   isReady: boolean;
   traceConfiguration: TraceConfiguration;
-  appVersion: string;
   serverUrl: string;
+  keyServerUrl: string;
+  keyServerType: KeyServerType;
   authToken: string;
   refreshToken: string;
   notificationTitle: string;
   notificationDescription: string;
   callbackNumber?: string;
   analyticsOptin?: boolean;
-  debug?: boolean;
 }
+
+export const getVersion = async () => {
+  try {
+    const result = await ExposureNotification.version();
+    return result;
+  } catch (e) {
+    console.log('build version error', e);
+  }
+};
+
+export const getBundleId = async () => {
+  try {
+    const result = await ExposureNotification.bundleId();
+    return result;
+  } catch (e) {
+    console.log('bundle id error', e);
+  }
+};
 
 export const ExposureProvider: React.FC<ExposureProviderProps> = ({
   children,
   isReady = false,
   traceConfiguration,
-  appVersion,
   serverUrl,
+  keyServerUrl,
+  keyServerType = KeyServerType.nearform,
   authToken = '',
   refreshToken = '',
   notificationTitle,
   notificationDescription,
   callbackNumber = '',
-  analyticsOptin = false,
-  debug = false
+  analyticsOptin = false
 }) => {
   const [state, setState] = useState<State>(initialState);
-  const unknownStatusTimer = useRef<any>(null);
 
   useEffect(() => {
     function handleEvent(
@@ -156,13 +179,6 @@ export const ExposureProvider: React.FC<ExposureProviderProps> = ({
     };
   }, []);
 
-  const clearAndResetTimer = (timerRef: any) => {
-    if (timerRef && timerRef.current) {
-      clearTimeout(timerRef.current);
-      timerRef.current = null;
-    }
-  };
-
   useEffect(() => {
     async function checkSupportAndStart() {
       await supportsExposureApi();
@@ -173,23 +189,16 @@ export const ExposureProvider: React.FC<ExposureProviderProps> = ({
         state.permissions.exposure.status === PermissionStatus.Allowed
       ) {
         await configure();
-        start();
-      }
+        const latestStatus = await ExposureNotification.status();
 
-      if (state.status.state === StatusState.unknown) {
-        clearAndResetTimer(unknownStatusTimer);
-        unknownStatusTimer.current = setTimeout(() => {
-          setState((s) => ({...s, initialised: true}));
-        }, 5000);
-      } else {
-        clearAndResetTimer(unknownStatusTimer);
-        setState((s) => ({...s, initialised: true}));
+        if (
+          !(latestStatus && latestStatus.type?.indexOf(StatusType.paused) > -1)
+        ) {
+          start();
+        }
       }
     }
-
     checkSupportAndStart();
-
-    return () => clearAndResetTimer(unknownStatusTimer);
   }, [state.permissions, isReady]);
 
   const supportsExposureApi = async function () {
@@ -207,26 +216,52 @@ export const ExposureProvider: React.FC<ExposureProviderProps> = ({
       supported: is,
       isAuthorised
     }));
-
-    if (enabled) {
-      await configure();
-      getCloseContacts();
-    }
+    await validateStatus(status);
+    await getCloseContacts();
   };
 
   const validateStatus = async (status?: Status) => {
     let newStatus = status || ((await ExposureNotification.status()) as Status);
     const enabled = await ExposureNotification.exposureEnabled();
-    setState((s) => ({...s, status: newStatus, enabled}));
+    const isAuthorised = await ExposureNotification.isAuthorised();
+    const canSupport = await ExposureNotification.canSupport();
+
+    const isStarting =
+      (isAuthorised === AuthorisedStatus.unknown ||
+        isAuthorised === AuthorisedStatus.granted) &&
+      newStatus.state === StatusState.unavailable &&
+      newStatus.type?.includes(StatusType.starting);
+    const initialised = !isStarting || !canSupport;
+
+    setState((s) => ({
+      ...s,
+      status: newStatus,
+      enabled,
+      isAuthorised,
+      canSupport,
+      initialised
+    }));
   };
 
   const start = async () => {
     try {
-      await ExposureNotification.start();
+      const result = await ExposureNotification.start();
       await validateStatus();
       await getCloseContacts();
+
+      return result;
     } catch (err) {
       console.log('start err', err);
+    }
+  };
+
+  const pause = async () => {
+    try {
+      const result = await ExposureNotification.pause();
+      await validateStatus();
+      return result;
+    } catch (err) {
+      console.log('pause err', err);
     }
   };
 
@@ -249,19 +284,17 @@ export const ExposureProvider: React.FC<ExposureProviderProps> = ({
       const config = {
         exposureCheckFrequency: traceConfiguration.exposureCheckInterval,
         serverURL: serverUrl,
+        keyServerUrl,
+        keyServerType,
         authToken,
         refreshToken,
         storeExposuresFor: traceConfiguration.storeExposuresFor,
         fileLimit:
           Platform.OS === 'ios' ? iosLimit : traceConfiguration.fileLimit,
-        version: appVersion,
         notificationTitle,
         notificationDesc: notificationDescription,
         callbackNumber,
-        analyticsOptin,
-        // this is an undocumented param
-        // @ts-ignore
-        debug
+        analyticsOptin
       };
 
       await ExposureNotification.configure(config);
@@ -275,6 +308,10 @@ export const ExposureProvider: React.FC<ExposureProviderProps> = ({
 
   const checkExposure = (readDetails: boolean, skipTimeCheck: boolean) => {
     ExposureNotification.checkExposure(readDetails, skipTimeCheck);
+  };
+
+  const simulateExposure = (timeDelay: number) => {
+    ExposureNotification.simulateExposure(timeDelay);
   };
 
   const getDiagnosisKeys = () => {
@@ -296,13 +333,9 @@ export const ExposureProvider: React.FC<ExposureProviderProps> = ({
 
   const getCloseContacts = async () => {
     try {
-      if (state.permissions.exposure.status === PermissionStatus.Allowed) {
-        await configure();
-        const contacts = await ExposureNotification.getCloseContacts();
-        setState((s) => ({...s, contacts}));
-        return contacts;
-      }
-      return [];
+      const contacts = await ExposureNotification.getCloseContacts();
+      setState((s) => ({...s, contacts}));
+      return contacts;
     } catch (err) {
       console.log('getCloseContacts err', err);
       return null;
@@ -369,8 +402,10 @@ export const ExposureProvider: React.FC<ExposureProviderProps> = ({
     ...state,
     start,
     stop,
+    pause,
     configure,
     checkExposure,
+    simulateExposure,
     getDiagnosisKeys,
     exposureEnabled,
     authoriseExposure,
